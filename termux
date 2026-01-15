@@ -1,0 +1,71 @@
+termux 
+pkg update && pkg install -y python && pip install paho-mqtt && cat > mqtt_client.py << 'EOF'
+#!/usr/bin/env python3
+import sys, json
+import paho.mqtt.client as mqtt
+
+def rotr64(x,n): return ((x>>n)|(x<<(64-n)))&0xFFFFFFFFFFFFFFFF
+def b2u64(d,o): return sum(d[o+i]<<(56-8*i) for i in range(8))
+def u642b(v): return bytes((v>>(56-8*i))&0xFF for i in range(8))
+
+def ascon_perm(s,r):
+    for i in range(12-r,12):
+        s[2]^=((0xF-i)<<4)|i; s[0]^=s[4]; s[4]^=s[3]; s[2]^=s[1]
+        t=[s[j]^(~s[(j+1)%5]&s[(j+2)%5]) for j in range(5)]; s[:]=t
+        s[1]^=s[0]; s[0]^=s[4]; s[3]^=s[2]; s[2]=~s[2]&0xFFFFFFFFFFFFFFFF
+        s[0]^=rotr64(s[0],19)^rotr64(s[0],28); s[1]^=rotr64(s[1],61)^rotr64(s[1],39)
+        s[2]^=rotr64(s[2],1)^rotr64(s[2],6); s[3]^=rotr64(s[3],10)^rotr64(s[3],17)
+        s[4]^=rotr64(s[4],7)^rotr64(s[4],41)
+
+def decrypt(ct,ad,k,n,t):
+    s=[0x80400c0600000000,b2u64(k,0),b2u64(k,8),b2u64(n,0),b2u64(n,8)]
+    ascon_perm(s,12); s[3]^=b2u64(k,0); s[4]^=b2u64(k,8)
+    if len(ad)==0: s[4]^=1
+    else:
+        o=0
+        while o<len(ad):
+            bs=min(8,len(ad)-o); ab=bytearray(8); ab[:bs]=ad[o:o+bs]
+            if bs<8: ab[bs]=0x80
+            s[0]^=b2u64(bytes(ab),0); o+=bs
+            if o<len(ad): ascon_perm(s,6)
+        s[4]^=1
+    pt=bytearray(); o=0
+    while o<len(ct):
+        bs=min(8,len(ct)-o); ks=u642b(s[0])
+        for i in range(bs): pt.append(ct[o+i]^ks[i])
+        cb=bytearray(8); cb[:bs]=ct[o:o+bs]
+        if bs<8: cb[bs]=0x80
+        s[0]=b2u64(bytes(cb),0); o+=bs
+        if o<len(ct): ascon_perm(s,6)
+    s[1]^=b2u64(k,0); s[2]^=b2u64(k,8); ascon_perm(s,12)
+    s[3]^=b2u64(k,0); s[4]^=b2u64(k,8)
+    if u642b(s[3])+u642b(s[4])!=t: raise ValueError("Auth failed!")
+    return bytes(pt)
+
+K=bytes([1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16])
+
+def on_conn(c,u,f,rc):
+    if rc==0: print("✅ Connecté\n📡 Écoute...\n"); c.subscribe("smartguardian/alert")
+    else: print(f"❌ Erreur: {rc}")
+
+def on_msg(c,u,m):
+    try:
+        d=json.loads(m.payload.decode())
+        pt=decrypt(bytes.fromhex(d['cipher']),d['ad'].encode(),K,bytes.fromhex(d['nonce']),bytes.fromhex(d['tag']))
+        sd=json.loads(pt.decode())
+        print("═"*50+f"\n🔓 DÉCRYPTÉ:\n{'─'*50}")
+        print(f"⏱️  Temps: {sd['ts']}s\n🔊 Son: {'DÉTECTÉ' if sd['sound'] else 'Normal'}")
+        print(f"🚪 Porte: {'OUVERTE' if sd['door'] else 'Fermée'}\n💥 Choc: {'DÉTECTÉ' if sd['shock'] else 'Normal'}")
+        print(f"⚠️  Menace: {sd['threat']}/100\n{'═'*50}\n")
+    except Exception as e: print(f"❌ Erreur: {e}\n")
+
+if len(sys.argv)!=2: print("Usage: python3 mqtt_client.py <BROKER_IP>"); sys.exit(1)
+print("╔════════════════════════════╗\n║ SMART GUARDIAN Client      ║\n╚════════════════════════════╝\n")
+c=mqtt.Client(); c.on_connect=on_conn; c.on_message=on_msg
+try: c.connect(sys.argv[1],1883,60); c.loop_forever()
+except KeyboardInterrupt: print("\n👋 Arrêt")
+except Exception as e: print(f"❌ {e}")
+EOF
+chmod +x mqtt_client.py && python3 mqtt_client.py 192.168.100.230
+
+
